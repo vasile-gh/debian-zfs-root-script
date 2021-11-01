@@ -1,0 +1,10 @@
+#!/bin/bash
+if [ -d /sys/firmware/efi ]; then
+  chroot /tmp/target umount /boot/efi
+fi
+for mnt in dev sys proc; do
+  umount --recursive --force --lazy /tmp/target/$mnt
+done
+mount | grep zfs | tac | awk '/\/tmp\/target/ {print $3}' | xargs -i{} umount -lf {}
+zpool export -a
+rmdir /tmp/target

@@ -1,0 +1,26 @@
+#!/bin/bash
+mkdir -p /tmp/target
+
+zpool import -f -R /tmp/target -N rpool
+zpool import -f -R /tmp/target -N bpool
+
+zfs mount rpool/ROOT/debian
+mkdir -p /tmp/target/dev
+mkdir -p /tmp/target/proc
+mkdir -p /tmp/target/sys
+mount --rbind /dev  /tmp/target/dev
+mount --rbind /proc /tmp/target/proc
+mount --rbind /sys  /tmp/target/sys
+zfs mount bpool/BOOT/debian
+zfs mount rpool/home
+zfs mount rpool/home/root
+zfs mount rpool/tmp
+zfs mount rpool/var
+zfs mount rpool/var/cache
+zfs mount rpool/var/lib
+zfs mount rpool/var/log
+zfs mount rpool/var/spool
+zfs mount rpool/var/tmp
+if [ -d /sys/firmware/efi ]; then
+  chroot /tmp/target mount /boot/efi
+fi
