@@ -18,7 +18,7 @@ Script to bootstrap a zfs root based debian from a basic debian install (which w
 2. Change first section of `zroot-install` to set up the parameters for your zfs root system.
 3. Run `zroot-install`
 4. Reboot
-5. You may be unable to ssh into the new system after the first run (you will certainly be able to log on at the consile). In this case just reboot a second time.
+5. You may be unable to ssh into the new system after the first run (you will certainly be able to log on at the console). In this case just reboot a second time.
 7. Enjoy.
 8. In case you mess up later, you will be able to revert your zfs system to its pristine state by rolling back to the snapshots handily created by this script at installation time
 
