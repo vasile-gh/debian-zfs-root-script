@@ -4,11 +4,11 @@ Script to bootstrap a zfs root based debian from a basic debian install (which w
 ## Prerequisites:
 * a basic Debian (at least v11, `bullseye`) install
 * the disk must be partitioned with either MBR or GPT partition types
-* **If** the disk is **MBR**, then
+* **if** the disk is **MBR**, then
   * you may have **at most** two **primary** partitions (zfs root debian requires two primary partitions to install: one for the boot zpool and the other for the system zpool)
   * **no** extended partitions and
   * the Debian root **must** be on the last one
-* **If** the disk is **GPT**, then
+* **if** the disk is **GPT**, then
   * the Debian root **must** be on the last partition
 * you must have at least 4GB free space **after** the last partition
 * your system **must** be configured to have passwordless ssh into root and the `authorised_keys` file must be in the .ssh subfolder of the root home folder 
