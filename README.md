@@ -1,5 +1,5 @@
 # debian-zfs-root-script
-Script to bootstrap a zfs root based debian from a basic debian install (which will afterwards used as rescue install)
+Script to bootstrap a zfs root based debian from a basic debian install (which will afterwards be used as rescue install)
 
 ## Prerequisites:
 * a basic Debian (at least v11, `bullseye`) install
