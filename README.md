@@ -11,7 +11,7 @@ Script to bootstrap a zfs root based debian from a basic debian install (which w
 * **if** the disk is **GPT**, then
   * the Debian root **must** be on the last partition
 * you must have at least 4GB free space **after** the last partition
-* your system **must** be configured to have passwordless ssh into root and the `authorised_keys` file must be in the .ssh subfolder of the root home folder 
+* your system **must** be configured to have passwordless ssh into root and the `authorized_keys` file must be in the .ssh subfolder of the root home folder 
 
 ## How To
 1. Copy the three scripts in your root home folder.
