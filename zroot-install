@@ -1,0 +1,533 @@
+#!/bin/bash
+
+################################################################################
+# This file is part of debian-zfs-root-script.
+#
+# debian-zfs-root-script is free software: you can redistribute it
+# and/or modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation, either version 3
+# of the License, or (at your option) any later version.
+#
+# debian-zfs-root-script is distributed in the hope that it will
+# be useful, but WITHOUT ANY WARRANTY; without even the implied
+# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with debian-zfs-root-script.
+# If not, see <https://www.gnu.org/licenses/>.
+################################################################################
+
+##################################################
+############ change below as needed ##############
+##################################################
+
+cat <<EOF >/tmp/preseed-zfs.txt
+tzdata tzdata/Areas select Europe
+tzdata tzdata/Zones/Europe select Bucharest
+locales locales/default_environment_locale select en_US.UTF-8
+locales locales/locales_to_be_generated multiselect en_GB.UTF-8 UTF-8, en_US.ISO-8859-15 ISO-8859-15, en_US.UTF-8 UTF-8, fr_BE.UTF-8 UTF-8
+zfs-dkms zfs-dkms/stop-build-for-32bit-kernel boolean true
+zfs-dkms zfs-dkms/note-incompatible-licenses note
+zfs-dkms zfs-dkms/stop-build-for-unknown-kernel boolean true
+EOF
+
+# in MiB
+BPOOLSIZE=512
+
+# don't add the /dev/ in front of the disk designation
+BIOSGRUBDISK="vda"
+
+RAMTMPFS=no
+ROOTPWD="whatever"
+
+NEWHOST=myhost
+RPOOLNAME=rpool
+BPOOLNAME=bpool
+DISTRIB=bullseye
+SWAPSIZE=1G
+
+##################################################
+################## end settings ##################
+##################################################
+
+#####################################################################
+## do not change anything below unless you know what are you doing ##
+#####################################################################
+
+#0. set up what I like
+#scp .bash_profile .bashrc .profile root@...
+
+# first copy the authorised_keys
+#sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+#sed -i 's/PermitRootLogin yes/#PermitRootLogin yes/' /etc/ssh/sshd_config
+
+ME=`basename "$0"`
+ME=${ME%.*}
+exec > >(tee -i $ME.log)
+exec 2>&1
+
+MSGNUM=1
+printf "\n============ ############# $((MSGNUM++)). ensure that I can login without password\n"
+grep -q -r '^PermitRootLogin prohibit-password' /etc/ssh
+PROHIBITPWD=$?
+if [ $PROHIBITPWD -eq 1 ] || \
+   [ ! -e ~/.ssh/authorized_keys ]; then
+  echo "      aborting: your system does not allow passwordless root login"
+else
+  echo "      yes"
+fi
+
+printf "\n============ ############# $((MSGNUM++)). checking that I am running as root\n"
+if [ `id -u` != "0" ]; then
+  echo "      aborting, this script must be run as root"
+  exit 1
+else
+  echo "      yes"
+fi
+
+printf "\n============ ############# $((MSGNUM++)). finding root partition & device\n"
+ROOTDEV=`lsblk -oMOUNTPOINT,PKNAME -P | grep 'MOUNTPOINT="/"' | \
+  sed -E 's/.+PKNAME="(.+)".*$/\1/'`
+ROOTPARTNUM=`lsblk -oMOUNTPOINT,NAME -P | grep 'MOUNTPOINT="/"' | \
+  sed -E 's/.+NAME="[^0-9]+([0-9]+)".*$/\1/'`
+echo "      root partition is $ROOTPARTNUM on device $ROOTDEV ($ROOTDEV$ROOTPARTNUM)"
+
+printf "\n============ ############# $((MSGNUM++)). checking that partition table is either gpt or msdos\n"
+LABELTYPE=`parted -m /dev/$ROOTDEV -- unit MiB print | head -2 | \
+    tail -1 | awk -F ':' '{print $6}'`
+if [ "$LABELTYPE" != "gpt" ] && [ "$LABELTYPE" != "msdos" ]; then
+  echo "      unsupported partition table ($LABELTYPE)"
+  exit 1
+else
+  echo "      found $LABELTYPE partition"
+fi
+
+printf "\n============ ############# $((MSGNUM++)). finding boot type (bios or uefi)\n"
+if [ -d /sys/firmware/efi ]; then
+  BOOTTYPE="uefi"
+else
+  BOOTTYPE="bios"
+fi
+echo "      boot type is $BOOTTYPE"
+
+if [ "$BOOTTYPE" == "uefi" ]; then
+  printf "\n============ ############# $((MSGNUM++)). finding the efi partition\n"
+  EFIPART=`mount | grep '/boot/efi type vfat' | sed -E 's#/dev/([^ ]+).*#\1#'`
+  echo "      efi partition is $EFIPART"
+else
+  printf "\n============ ############# $((MSGNUM++)). grub boot disk\n"
+  echo "      $BIOSGRUBDISK"
+fi
+
+printf "\n============ ############# $((MSGNUM++)). checking that $ROOTDEV$ROOTPARTNUM is the last partition on device\n"
+if [ `parted -s -m /dev/$ROOTDEV print | wc -l` -eq $((ROOTPARTNUM+2)) ]; then
+  echo "      yes"
+else
+  echo "      no, aborting"
+  exit 1
+fi
+
+printf "\n============ ############# $((MSGNUM++)). checking that there is at least 4GB unpartitioned space at the end\n"
+DISKSIZE=`parted -m /dev/$ROOTDEV -- unit MiB print | head -2 | \
+    tail -1 | awk -F ':' '{print $2}'`
+DISKSIZE=${DISKSIZE%MiB}
+LASTPARTEND=`parted -m /dev/$ROOTDEV -- unit MiB print | \
+    tail -1 | awk -F ':' '{print $3}'`
+LASTPARTEND=${LASTPARTEND%MiB}
+FREESPACE=$((DISKSIZE-LASTPARTEND))
+echo "      free space is $FREESPACE MiB"
+if [ $FREESPACE -le 4096 ]; then
+  echo "        insufficient space, aborting"
+  exit
+fi
+
+printf "\n============ ############# $((MSGNUM++)). [if MBR] checking that I can create two more primary partitions\n"
+if [ $ROOTPARTNUM -gt 2 ]; then
+  echo "      no more than two partitions may already exist on MBR"
+  exit 1
+fi
+
+printf "\n============ ############# $((MSGNUM++)). creating $BPOOLNAME partition\n"
+BPOOLSTART=`parted -m /dev/$ROOTDEV -- unit MiB print | awk -F ':' '$1 == '$ROOTPARTNUM' { print $3}'`
+BPOOLSTART=${BPOOLSTART%%MiB}
+BPOOLEND=$((BPOOLSTART+BPOOLSIZE))
+
+if [ "$LABELTYPE" == "gpt" ]; then
+  parted -s /dev/$ROOTDEV -- unit MiB mkpart zfs-$BPOOLNAME $BPOOLSTART $BPOOLEND
+else
+  parted -s /dev/$ROOTDEV -- unit MiB mkpart primary $BPOOLSTART $BPOOLEND
+fi
+
+printf "\n============ ############# $((MSGNUM++)). creating $RPOOLNAME partition\n"
+LASTPARTEND=`parted -m /dev/$ROOTDEV -- unit MiB print | \
+    tail -1 | awk -F ':' '{print $3}'`
+LASTPARTEND=${LASTPARTEND%MiB}
+ENDRPOOL=$((DISKSIZE-1))
+if [ "$LABELTYPE" == "gpt" ]; then
+  parted -s /dev/$ROOTDEV -- unit MiB mkpart zfs-$RPOOLNAME $LASTPARTEND $ENDRPOOL
+else
+  parted -s /dev/$ROOTDEV -- unit MiB mkpart primary $LASTPARTEND $ENDRPOOL
+fi
+
+printf "\n============ ############# $((MSGNUM++)). making sure rescue has zfs available\n"
+apt update
+apt -y dist-upgrade
+echo "RESUME=none" >/etc/initramfs-tools/conf.d/resume
+DEBIAN_FRONTEND=noninteractive
+apt install -yq linux-image-amd64 linux-headers-amd64 discus \
+  parted fdisk zfs-dkms
+systemctl disable zfs-mount
+systemctl disable zfs-share
+apt install -yq zfsutils-linux zfs-zed zfs-initramfs
+systemctl enable zfs-mount
+systemctl enable zfs-share
+
+apt update
+apt -y dist-upgrade
+
+update-initramfs -u -k all
+
+cd
+
+PARTBOOT=$ROOTDEV$((ROOTPARTNUM+1))
+PARTMAIN=$ROOTDEV$((ROOTPARTNUM+2))
+echo PARTBOOT=$PARTBOOT
+echo PARTMAIN=$PARTMAIN
+
+rm -Rf  /tmp/target
+mkdir -p /tmp/target
+
+/sbin/modprobe zfs
+
+printf "\n============ ############# $((MSGNUM++)). destroying (in case they exist) $BPOOLNAME and $RPOOLNAME\n"
+
+zpool destroy $BPOOLNAME
+zpool destroy $RPOOLNAME
+
+printf "\n============ ############# $((MSGNUM++)). creating $BPOOLNAME\n"
+
+zpool create -f \
+    -o cachefile=/etc/zfs/zpool.cache \
+    -o ashift=12 -d \
+    -o feature@async_destroy=enabled \
+    -o feature@bookmarks=enabled \
+    -o feature@embedded_data=enabled \
+    -o feature@empty_bpobj=enabled \
+    -o feature@enabled_txg=enabled \
+    -o feature@extensible_dataset=enabled \
+    -o feature@filesystem_limits=enabled \
+    -o feature@hole_birth=enabled \
+    -o feature@large_blocks=enabled \
+    -o feature@lz4_compress=enabled \
+    -o feature@spacemap_histogram=enabled \
+    -o feature@zpool_checkpoint=enabled \
+    -O acltype=posixacl -O canmount=off -O compression=lz4 \
+    -O devices=off -O normalization=formD -O relatime=on -O xattr=sa \
+    -O mountpoint=none \
+    -R /tmp/target $BPOOLNAME /dev/$PARTBOOT
+
+printf "\n============ ############# $((MSGNUM++)). creating $RPOOLNAME\n"
+
+zpool create -f \
+    -o ashift=12 \
+    -O acltype=posixacl -O canmount=off -O compression=lz4 \
+    -O dnodesize=auto -O normalization=formD -O relatime=on \
+    -O xattr=sa -O mountpoint=/ \
+    -R /tmp/target $RPOOLNAME /dev/$PARTMAIN
+
+printf "\n============ ############# $((MSGNUM++)). creating all datasets\n"
+zfs create -o canmount=off -o mountpoint=none  $RPOOLNAME/ROOT
+zfs create -o canmount=noauto -o mountpoint=/  $RPOOLNAME/ROOT/debian
+zfs mount $RPOOLNAME/ROOT/debian
+
+#must create and mount it after root dataset
+zfs create -o canmount=off -o mountpoint=none  $BPOOLNAME/BOOT
+zfs create -o mountpoint=/boot $BPOOLNAME/BOOT/debian
+
+zfs create                                 $RPOOLNAME/home
+zfs create -o mountpoint=/root             $RPOOLNAME/home/root
+chmod 700 /tmp/target/root
+zfs create                                 $RPOOLNAME/var
+zfs create                                 $RPOOLNAME/var/lib
+zfs create                                 $RPOOLNAME/var/log
+zfs create                                 $RPOOLNAME/var/spool
+zfs create -o com.sun:auto-snapshot=false  $RPOOLNAME/var/cache
+zfs create -o com.sun:auto-snapshot=false  $RPOOLNAME/var/tmp
+chmod 1777 /tmp/target/var/tmp
+
+
+printf "\n============ ############# $((MSGNUM++)). creating tmpfs\n"
+if [ "$RAMTMPFS" == "yes" ]; then
+  mkdir /tmp/target/run
+  mount -t tmpfs tmpfs /tmp/target/run
+  mkdir /tmp/target/run/lock
+else
+  zfs create -o com.sun:auto-snapshot=false -o setuid=off -o exec=on  $RPOOLNAME/tmp
+  chmod 1777 /tmp/target/tmp
+fi
+
+printf "\n============ ############# $((MSGNUM++)). creating zfs swap dataset\n"
+zfs create -V $SWAPSIZE -b $(getconf PAGESIZE)    \
+  -o primarycache=metadata -o secondarycache=none \
+  -o logbias=throughput -o sync=always \
+  -o com.sun:auto-snapshot=false -o compression=zle $RPOOLNAME/swap
+
+mkswap -f /dev/zvol/$RPOOLNAME/swap
+
+printf "\n============ ############# $((MSGNUM++)). install and run debootstrap\n"
+apt install -y debootstrap
+
+debootstrap --include=openssh-server,locales,joe,nano,rsync,sharutils,psmisc,\
+htop,patch,less,bash-completion,console-setup \
+  $DISTRIB /tmp/target http://http.debian.net/debian/
+
+printf "\n============ ############# $((MSGNUM++)). misc settings\n"
+zfs set devices=off $RPOOLNAME
+
+echo $NEWHOST >/tmp/target/etc/hostname
+sed -i "1s/^/127.0.1.1\t$NEWHOST\n/" /tmp/target/etc/hosts
+
+# http://blog.schlomo.schapiro.org/2013/11/setting-hostname-from-dhcp-in-debian.html
+echo unset old_host_name >/tmp/target/etc/dhcp/dhclient-enter-hooks.d/unset_old_hostname
+chmod +x /tmp/target/etc/dhcp/dhclient-enter-hooks.d/unset_old_hostname
+
+NETDEV=`ip route | grep default | awk '{print $5}'`
+echo -e "\nauto lo\niface lo inet loopback\n"        >/tmp/target/etc/network/interfaces
+echo -e "\nauto $NETDEV\niface $NETDEV inet dhcp\n" >>/tmp/target/etc/network/interfaces
+echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4"     >/tmp/target/etc/resolv.conf
+
+cat << EOF >>/tmp/target/etc/fstab
+# /etc/fstab: static file system information.
+#
+# Use 'blkid' to print the universally unique identifier for a
+# device; this may be used with UUID= as a more robust way to name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# <file system>         <mount point>   <type>  <options>       <dump>  <pass>
+/dev/zvol/$RPOOLNAME/swap     none            swap    discard        0       0
+EOF
+
+printf "\n============ ############# $((MSGNUM++)). creating sources.list\n"
+cat <<EOF >/tmp/target/etc/apt/sources.list
+deb http://deb.debian.org/debian/              $DISTRIB          main contrib non-free
+deb http://security.debian.org/debian-security $DISTRIB-security main contrib non-free
+deb http://deb.debian.org/debian/              $DISTRIB-updates  main contrib non-free
+EOF
+
+printf "\n============ ############# $((MSGNUM++)). mount rbind to prep for chroot\n"
+mount --rbind /dev  /tmp/target/dev
+mount --rbind /proc /tmp/target/proc
+mount --rbind /sys  /tmp/target/sys
+
+printf "\n============ ############# $((MSGNUM++)). more misc settings\n"
+chroot /tmp/target ln -s /proc/self/mounts /etc/mtab
+chroot /tmp/target chmod oug+rwx /tmp
+
+printf "\n============ ############# $((MSGNUM++)). chroot apt update\n"
+chroot /tmp/target apt update
+
+#perl -i -pe 's/# (en_US.UTF-8)/$1/' /tmp/target/etc/locale.gen
+#perl -i -pe 's/# (en_GB.UTF-8)/$1/' /tmp/target/etc/locale.gen
+#perl -i -pe 's/# (fr_BE.UTF-8)/$1/' /tmp/target/etc/locale.gen
+#echo 'LANG="en_US.UTF-8"' > /tmp/target/etc/default/locale
+#chroot /tmp/target /usr/sbin/locale-gen
+
+printf "\n============ ############# $((MSGNUM++)). build some locales and fix tzdata\n"
+# for later - use preseeding
+# https://stackoverflow.com/questions/8671308/non-interactive-method-for-dpkg-reconfigure-tzdata
+
+cp /tmp/preseed-zfs.txt /tmp/target/tmp/preseed-zfs.txt
+cat << EOF | chroot /tmp/target
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+debconf-set-selections /tmp/preseed-zfs.txt
+
+rm /etc/localtime
+rm /etc/timezone
+rm /etc/locale.gen
+
+debconf-show locales
+debconf-show tzdata
+
+dpkg-reconfigure locales
+dpkg-reconfigure tzdata
+EOF
+
+printf "\n============ ############# $((MSGNUM++)). tasksel standard\n"
+cat << EOF | chroot /tmp/target
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+tasksel install standard
+EOF
+
+printf "\n============ ############# $((MSGNUM++)). acpi\n"
+
+if [ -d /proc/acpi ]; then
+  chroot /tmp/target apt install --yes acpi acpid
+  chroot /tmp/target service acpid stop
+fi
+
+printf "\n============ ############# $((MSGNUM++)). root login over ssh with key\n"
+echo PermitRootLogin without-password >/tmp/target//etc/ssh/sshd_config.d/rootlogin.conf
+
+printf "\n============ ############# $((MSGNUM++)). installing syslog-ng\n"
+chroot /tmp/target apt install --yes syslog-ng
+
+printf "\n============ ############# $((MSGNUM++)). no need to compress logs on zfs, so disable log compression\n"
+for file in /tmp/target/etc/logrotate.d/* ; do
+  if grep -Eq "(^|[^#y])compress" "$file" ; then
+    sed -i -r "s/(^|[^#y])(compress)/\1#\2/" "$file"
+  fi
+done
+
+printf "\n============ ############# $((MSGNUM++)). installing zfs-dkms on zfs root\n"
+cp /tmp/preseed-zfs.txt /tmp/target/tmp/preseed-zfs.txt
+cat << EOF | chroot /tmp/target
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true
+debconf-set-selections /tmp/preseed-zfs.txt
+
+debconf-show zfs-dkms
+
+apt  upgrade --yes
+apt  autoremove --yes
+
+apt install -yq linux-image-amd64 linux-headers-amd64
+apt install -yq zfs-dkms
+apt install -yq zfs-initramfs
+EOF
+
+printf "\n============ ############# $((MSGNUM++)). more misc settings\n"
+# must be after installing zfs because of zgenhostid
+# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=595790
+rm /tmp/target/etc/hostid
+chroot /tmp/target zgenhostid
+
+printf "\n============ ############# $((MSGNUM++)). install appropriate version of grub\n"
+if [ "$BOOTTYPE" == "uefi" ]; then
+  chroot /tmp/target apt install --yes grub-efi
+else
+  chroot /tmp/target apt install --yes grub-pc
+fi
+
+printf "\n============ ############# $((MSGNUM++)). zfs root system will have the same keys as rescue\n"
+cp /etc/ssh/ssh_host_* /tmp/target/etc/ssh/
+
+printf "\n============ ############# $((MSGNUM++)). some grub default options\n"
+perl -i -pe 's/quiet/quiet rootflags=rw,noatime,norelatime/'  /tmp/target/etc/default/grub
+perl -i -pe 's/^#(GRUB_DISABLE_LINUX_UUID=true)/${1}/'        /tmp/target/etc/default/grub
+perl -i -pe "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\" root=ZFS=$RPOOLNAME\/ROOT\/debian /" \
+  /tmp/target/etc/default/grub
+
+printf "\n============ ############# $((MSGNUM++)). copy zpool cache over to zfs root\n"
+mkdir -p /tmp/target/etc/zfs
+cp /etc/zfs/zpool.cache /tmp/target/etc/zfs/
+
+printf "\n============ ############# $((MSGNUM++)). no suspend/resume\n"
+# Disable suspend/resume from/to disk
+mkdir -p /tmp/target/etc/initramfs-tools/conf.d
+echo RESUME=none > /tmp/target/etc/initramfs-tools/conf.d/resume
+
+printf "\n============ ############# $((MSGNUM++)). $BPOOLNAME must always be imported\n"
+cat > /tmp/target/etc/systemd/system/zfs-import-$BPOOLNAME.service <<UNIT
+[Unit]
+DefaultDependencies=no
+Before=zfs-import-scan.service
+Before=zfs-import-cache.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/zpool import -N -o cachefile=none $BPOOLNAME
+# Work-around to preserve zpool cache:
+ExecStartPre=-/bin/mv /etc/zfs/zpool.cache /etc/zfs/preboot_zpool.cache
+ExecStartPost=-/bin/mv /etc/zfs/preboot_zpool.cache /etc/zfs/zpool.cache
+
+[Install]
+WantedBy=zfs-import.target
+UNIT
+
+chroot /tmp/target systemctl enable zfs-import-$BPOOLNAME.service
+
+printf "\n============ ############# $((MSGNUM++)). if RAM tmpfs enable tmp.mount service\n"
+if [ "$RAMTMPFS" == "yes" ]; then
+  chroot /tmp/target cp /usr/share/systemd/tmp.mount /etc/systemd/system/
+  chroot /tmp/target systemctl enable tmp.mount
+fi
+
+printf "\n============ ############# $((MSGNUM++)). make sure zfs datasets are properly loaded\n"
+chroot /tmp/target ln -s /usr/lib/zfs-linux/zed.d/history_event-zfs-list-cacher.sh /etc/zfs/zed.d
+chroot /tmp/target mkdir -p /etc/zfs/zfs-list.cache
+chroot /tmp/target touch /etc/zfs/zfs-list.cache/$BPOOLNAME
+chroot /tmp/target touch /etc/zfs/zfs-list.cache/$RPOOLNAME
+chroot /tmp/target zed -F &
+until [ `wc -l /tmp/target/etc/zfs/zfs-list.cache/$BPOOLNAME | awk '{print $1}'` -gt 0 ] && \
+      [ `wc -l /tmp/target/etc/zfs/zfs-list.cache/$RPOOLNAME | awk '{print $1}'` -gt 0 ]
+do
+  sleep 1
+  zfs set canmount=on     $BPOOLNAME/BOOT/debian
+  zfs set canmount=noauto $RPOOLNAME/ROOT/debian
+  sleep 3
+done
+ZEDPID=`chroot /tmp/target ps | grep zed | awk '{print $1}'`
+kill -9 $ZEDPID
+sed -Ei "s|/tmp/target/?|/|" /etc/zfs/zfs-list.cache/*
+
+printf "\n============ ############# $((MSGNUM++)). install grub to disk\n"
+if [ `chroot /tmp/target grub-probe /boot` != "zfs" ]; then
+  echo "########## ERROR cannot not install grub ##########"
+  exit
+fi
+chroot /tmp/target update-initramfs -c -k all
+
+if [ "$BOOTTYPE" == "uefi" ]; then
+  EFIUUID=`blkid /dev/$EFIPART | sed -E 's/.* UUID="([^"]+)".*/\1/'`
+cat << EOF >>/tmp/target/etc/fstab
+UUID=$EFIUUID        /boot/efi       vfat    defaults        0       1
+EOF
+
+  mkdir /tmp/target/boot/efi
+  chroot /tmp/target mount /boot/efi
+fi
+
+chroot /tmp/target grub-install /dev/$ROOTDEV
+chroot /tmp/target update-grub
+
+if [ "$BOOTTYPE" == "uefi" ]; then
+  chroot /tmp/target umount /boot/efi
+fi
+
+printf "\n============ ############# $((MSGNUM++)). copy bash profile, etc.\n"
+cp -r ~/.ssh /tmp/target/root/
+cp ~/.bashrc ~/.profile ~/.bash_profile /tmp/target/root/
+
+printf "\n============ ############# $((MSGNUM++)). change root password on zfs root\n"
+chroot /tmp/target passwd
+
+printf "\n============ ############# $((MSGNUM++)). finally do a snapshot of the new system\n"
+zfs snapshot -r $BPOOLNAME@base
+zfs snapshot -r $RPOOLNAME@base
+
+printf "\n============ ############# $((MSGNUM++)). prep for reboot\n"
+mount | grep zfs | tac | awk '/\/tmp\/target/ {print $3}' | \
+    xargs -i{} umount -lf {}
+
+printf "\n============ ############# $((MSGNUM++)). exporting $BPOOLNAME and $RPOOLNAME\n"
+zpool export -a
+
+printf "\n============ ############# $((MSGNUM++)). READY TO REBOOT NOW into your zfs root system\n"
+printf "\n============ ############# $((MSGNUM++)). WARNING! if you want to login via ssh you need to reboot TWICE\n"
+
+###############################################################
+
+exit
+
+====================================================
+OBSOLETE from debian jessie - kept as aide-memoire
+====================================================
+
+# Workaround for grub mysteriously NOT searching devices in /dev/disk/by-id but in /dev
+cat << 'EOF' >/tmp/target/etc/udev/rules.d/70-zfs-grub-fix.rules
+KERNEL=="sd*", ENV{ID_SERIAL}=="?*", SYMLINK+="$env{ID_BUS}-$env{ID_SERIAL}"
+ENV{DEVTYPE}=="partition", IMPORT{parent}="ID_*", ENV{ID_FS_TYPE}=="zfs_member", SYMLINK+="$env{ID_BUS}-$env{ID_SERIAL}-part%n"
+EOF
+udevadm trigger; sleep 3
+udevadm trigger; sleep 3
