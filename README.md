@@ -2,7 +2,7 @@
 Script to bootstrap a zfs root based debian from a basic debian install (which will afterwards used as rescue install)
 
 ## Prerequisites:
-* a basic Debian install
+* a basic Debian (at least v11, `bullseye`) install
 * the disk must be partitioned with either MBR or GPT partition types
 * **If** the disk is **MBR**, then
   * you may have **at most** two **primary** partitions (zfs root debian requires two primary partitions to install: one for the boot zpool and the other for the system zpool)
